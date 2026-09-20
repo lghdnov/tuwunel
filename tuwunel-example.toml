@@ -2370,6 +2370,18 @@
 #
 #request_legacy_media = false
 
+# Advertise authenticated media support (MSC3916/MSC4180) to clients via
+# /_matrix/client/versions. When false, the stable feature flags are
+# withheld, so clients that honour them fall back to the legacy
+# unauthenticated /_matrix/media/ endpoints. The authenticated endpoints
+# themselves remain served.
+#
+# Defaults to true.
+#
+# reloadable: yes
+#
+#advertise_authenticated_media = true
+
 # When true, remote legacy content and thumbnail fetching is permitted.
 # When false, those remote legacy requests are rejected.
 #

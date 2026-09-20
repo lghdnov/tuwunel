@@ -2764,6 +2764,18 @@ pub struct Config {
 	#[serde(default)]
 	pub request_legacy_media: bool,
 
+	/// Advertise authenticated media support (MSC3916/MSC4180) to clients via
+	/// /_matrix/client/versions. When false, the stable feature flags are
+	/// withheld, so clients that honour them fall back to the legacy
+	/// unauthenticated /_matrix/media/ endpoints. The authenticated endpoints
+	/// themselves remain served.
+	///
+	/// Defaults to true.
+	///
+	/// reloadable: yes
+	#[serde(default = "true_fn")]
+	pub advertise_authenticated_media: bool,
+
 	/// When true, remote legacy content and thumbnail fetching is permitted.
 	/// When false, those remote legacy requests are rejected.
 	///

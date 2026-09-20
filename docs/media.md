@@ -30,6 +30,7 @@ use them.
 |---|---|---|
 | `allow_legacy_media` | `false` | Serve the unauthenticated `/_matrix/media/*/` endpoints locally. The authenticated equivalents are always enabled. |
 | `request_legacy_media` | `false` | Fall back to unauthenticated requests when fetching media from remote servers. Unauthenticated remote media was removed around 2024Q3; enabling this adds federation traffic that is unlikely to succeed. |
+| `advertise_authenticated_media` | `true` | Advertise authenticated media support (MSC3916/MSC4180) to clients via `/_matrix/client/versions`. When `false`, the stable feature flags are withheld, so clients that honour them fall back to the legacy unauthenticated endpoints. The authenticated endpoints themselves remain served; pair with `allow_legacy_media` so those clients have something to talk to. |
 
 ## Thumbnails
 

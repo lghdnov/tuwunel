@@ -37,6 +37,15 @@ pub(crate) async fn get_supported_versions_route(
 
 		unstable_features: UNSTABLE_FEATURES
 			.into_iter()
+			// Withholding the MSC3916/MSC4180 flags makes clients that honour
+			// them fall back to the legacy unauthenticated media endpoints.
+			.filter(|feature| {
+				services.config.advertise_authenticated_media
+					|| !matches!(
+						&**feature,
+						"org.matrix.msc3916.stable" | "org.matrix.msc4180"
+					)
+			})
 			.chain(
 				services
 					.config
