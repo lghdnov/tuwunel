@@ -106,23 +106,25 @@ pub async fn join<'a>(
 		.is_joined(sender_user, room_id)
 		.await
 	{
-		debug_warn!("{sender_user} is already joined in {room_id}");
+		debug_warn!(%sender_user, %room_id, "User is already joined.");
 		return Ok(());
 	}
 
 	// Resolved state can lag a federated re-invite; trust the invite index.
-	if let Ok(membership) = self
+	if self
 		.services
 		.state_accessor
 		.get_member(room_id, sender_user)
-		.await && membership.membership == MembershipState::Ban
-		&& !self
+		.await
+		.is_ok_and(|content| content.membership == MembershipState::Ban)
+		&& self
 			.services
 			.state_cache
 			.is_invited(sender_user, room_id)
 			.await
+			.is_false()
 	{
-		debug_warn!("{sender_user} is banned from {room_id} but attempted to join");
+		debug_warn!(%sender_user, %room_id, "Banned user attempted to join.");
 		return Err!(Request(Forbidden("You are banned from the room.")));
 	}
 
@@ -622,8 +624,8 @@ async fn ingest_send_join_state(
 		.ready_filter_map(Result::ok)
 		.ready_filter_map(|(event_id, value)| {
 			Pdu::from_object_federation(room_id, &event_id, value, room_version_rules)
-				.inspect_err(|e| {
-					debug_warn!("Invalid PDU {event_id:?} in send_join response: {e:?}");
+				.inspect_err(|error| {
+					debug_warn!(?event_id, %error, "Invalid PDU in the join response.");
 				})
 				.map(move |(pdu, value)| (event_id, pdu, value))
 				.ok()
@@ -770,14 +772,10 @@ async fn join_local(
 		| _ => Vec::new(),
 	};
 
-	let is_joined_restricted_rooms = restriction_rooms
-		.iter()
-		.stream()
-		.any(|restriction_room_id| {
-			self.services
-				.state_cache
-				.is_joined(sender_user, restriction_room_id)
-		})
+	let is_joined_restricted_rooms = self
+		.services
+		.state_cache
+		.is_joined_any(sender_user, restriction_rooms.iter().map(AsRef::as_ref))
 		.await;
 
 	let join_authorized_via_users_server = is_joined_restricted_rooms

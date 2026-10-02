@@ -19,9 +19,16 @@ use async_trait::async_trait;
 pub use context::Context;
 pub use create::create_admin_room;
 use futures::TryFutureExt;
-use ruma::{OwnedEventId, OwnedRoomAliasId, OwnedRoomId, RoomId, RoomOrAliasId, UserId};
+use ruma::{
+	OwnedEventId, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId, RoomOrAliasId, UserId,
+};
 use tokio::sync::mpsc;
-use tuwunel_core::{Err, Event, Result, debug, err, error::default_log, warn};
+use tuwunel_core::{
+	Err, Event, Result, debug, err, error::default_log, implement, matrix::event::MsgType,
+	utils::ReadyExt, warn,
+};
+
+use crate::rooms::state::RoomMutexGuard;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -33,11 +40,22 @@ pub struct Service {
 	pub console: Arc<console::Console>,
 }
 
-/// Inputs to a command are a multi-line string and optional reply_id.
+/// Inputs to a command: its multi-line text, the event to reply to, and who
+/// sent it.
+///
+/// An input without a sender is the operator's, from the console or the
+/// `admin_execute` and `admin_signal_execute` lists; converting a bare command
+/// string builds one.
 #[derive(Clone, Debug, Default)]
 pub struct CommandInput {
+	/// The command line, followed by any body lines.
 	pub command: String,
+
+	/// The event the command's response replies to.
 	pub reply_id: Option<OwnedEventId>,
+
+	/// The user who sent the command, or `None` for the operator.
+	pub sender: Option<OwnedUserId>,
 }
 
 /// Root of a clap command tree installed by a downstream crate.
@@ -62,6 +80,14 @@ pub type ProcessorResult = Result<Option<CommandOutput>, CommandOutput>;
 pub enum CommandOutput {
 	Markdown(String),
 	Plain(String),
+}
+
+impl From<String> for CommandInput {
+	fn from(command: String) -> Self { Self { command, ..Default::default() } }
+}
+
+impl From<&str> for CommandInput {
+	fn from(command: &str) -> Self { command.to_owned().into() }
 }
 
 impl CommandOutput {
@@ -137,11 +163,13 @@ impl crate::Service for Service {
 }
 
 impl Service {
-	/// Posts a command to the command processor queue and returns. Processing
-	/// will take place on the service worker's task asynchronously. Errors if
-	/// the queue is full.
-	pub async fn command(&self, command: String, reply_id: Option<OwnedEventId>) -> Result {
-		let Some(sender) = self
+	/// Queues a command for the service worker and returns once it is queued.
+	///
+	/// The worker processes it later and replies to the `reply_id` event in its
+	/// room, posting nothing without one. Queueing waits while the queue is
+	/// full, and errors when the queue is unavailable or closed.
+	pub async fn command(&self, input: CommandInput) -> Result {
+		let Some(queue) = self
 			.channel
 			.read()
 			.expect("locked for reading")
@@ -150,21 +178,19 @@ impl Service {
 			return Err!("Admin command queue unavailable.");
 		};
 
-		sender
-			.send(CommandInput { command, reply_id })
-			.await
+		queue
+			.send(input)
 			.map_err(|e| err!("Failed to enqueue admin command: {e:?}"))
+			.await
 	}
 
 	/// Dispatches a command to the processor on the current task and waits for
 	/// completion.
-	pub async fn command_in_place(
-		&self,
-		command: String,
-		reply_id: Option<OwnedEventId>,
-	) -> ProcessorResult {
-		self.process_command(&CommandInput { command, reply_id })
-			.await
+	///
+	/// The queue is bypassed, so the outcome returns to the caller rather than
+	/// being posted as a reply.
+	pub async fn command_in_place(&self, input: CommandInput) -> ProcessorResult {
+		self.process_command(&input).await
 	}
 
 	/// Invokes the tab-completer to complete the command. When unavailable,
@@ -223,6 +249,40 @@ impl Service {
 			.await
 	}
 
+	/// Checks whether a given user is the only active admin left on this server.
+	///
+	/// The server user is never counted: it can sign in only while an emergency
+	/// password is configured. Deactivated accounts still joined to the admin
+	/// room are not counted either, since none of them can sign in to act. Nor
+	/// is a passwordless account, such as an appservice's user, since it stores
+	/// the same empty password as a deactivated one.
+	pub async fn user_is_last_admin(&self, user_id: &UserId) -> bool {
+		let server_user: &UserId = &self.services.globals.server_user;
+		if user_id == server_user {
+			return false;
+		}
+
+		let Ok(admin_room) = self.get_admin_room().await else {
+			return false;
+		};
+
+		if !self
+			.services
+			.state_cache
+			.is_joined(user_id, &admin_room)
+			.await
+		{
+			return false;
+		}
+
+		!self
+			.services
+			.state_cache
+			.active_local_users_in_room(&admin_room)
+			.ready_any(|member| member != user_id && member != server_user)
+			.await
+	}
+
 	/// Gets the room ID of the admin room
 	///
 	/// Errors are propagated from the database, and will have None if there is
@@ -273,6 +333,13 @@ impl Service {
 			.ok_or_else(|| err!("server user is not joined to the configured report room"))
 	}
 
+	/// Returns whether a message event is an admin command to run.
+	///
+	/// Only an `m.text` from an admin qualifies: prefixed with `!admin` or the
+	/// server user's ID in the admin room, or escaped as `\!admin` by a local
+	/// admin anywhere when escape commands are enabled. The server user's own
+	/// messages in the admin room are refused unless the emergency password is
+	/// set.
 	pub async fn is_admin_command<Pdu>(&self, event: &Pdu, body: &str) -> bool
 	where
 		Pdu: Event,
@@ -311,6 +378,12 @@ impl Service {
 			return false;
 		}
 
+		// Spec: an m.notice must never be answered automatically. Other msgtypes'
+		// bodies are captions, filenames or emotes a forward or repost can carry.
+		if event.msgtype() != Some(MsgType::Text) {
+			return false;
+		}
+
 		// Prevent unescaped !admin from being used outside of the admin room
 		if is_public_prefix && !self.is_admin_room(event.room_id()).await {
 			return false;
@@ -345,4 +418,22 @@ impl Service {
 			.await
 			.unwrap_or(false)
 	}
+}
+
+/// Locks the admins room's state, when there is an admins room.
+///
+/// Hold the guard from the [`Service::user_is_last_admin`] check until the
+/// change it permits is made. The admins room's leave and ban guard runs under
+/// the same lock, so two concurrent removals cannot each see the other as the
+/// admin who remains.
+#[implement(Service)]
+pub async fn lock_admin_room(&self) -> Option<RoomMutexGuard> {
+	let admin_room = self.get_admin_room().await.ok()?;
+
+	self.services
+		.state
+		.mutex
+		.lock(&admin_room)
+		.await
+		.into()
 }

@@ -24,7 +24,8 @@ use tuwunel_core::{
 	matrix::pdu::PduCount,
 	trace,
 	utils::{
-		self, BoolExt, MutexMap, ReadyExt, hash::password as hash_password, stream::TryIgnore,
+		self, BoolExt, MutexMap, ReadyExt, hash::password as hash_password, result::NotFound,
+		stream::TryIgnore,
 	},
 };
 use tuwunel_database::{Deserialized, Json, Map};
@@ -181,11 +182,23 @@ impl Service {
 
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
-		// Revoke any SSO authorizations
-		self.services
-			.oauth
-			.revoke_user_tokens(user_id)
-			.await;
+		// Held until the password is cleared; see `lock_admin_room`.
+		let admin_lock = self.services.admin.lock_admin_room().await;
+
+		// Nobody would be left to reactivate this account or any other. Every
+		// deactivation path reaches here first, while the admins room refuses the
+		// last admin's departure only after the account is already deactivated.
+		if self
+			.services
+			.admin
+			.user_is_last_admin(user_id)
+			.await
+		{
+			return Err!(Request(Forbidden(
+				"Cannot deactivate the last admin of this server. Make another user an admin \
+				 first."
+			)));
+		}
 
 		// Remove all associated devices
 		self.all_device_ids(user_id)
@@ -197,6 +210,14 @@ impl Service {
 		// Systems like changing the password without logging in should check if the
 		// account is deactivated.
 		self.set_password(user_id, None).await?;
+		drop(admin_lock);
+
+		// Revoke any SSO authorizations, outside the lock since each is a request
+		// to the identity provider.
+		self.services
+			.oauth
+			.revoke_user_tokens(user_id)
+			.await;
 
 		// TODO: Unhook 3PID
 		Ok(())
@@ -235,10 +256,24 @@ impl Service {
 	/// however their account was created, and a localpart with no local
 	/// account passes on its way to registration.
 	pub async fn check_ldap_login(&self, user_id: &UserId) -> Result {
-		self.is_deactivated(user_id)
-			.unwrap_or_else(|_| false)
+		self.deactivated_check(user_id).await
+	}
+
+	/// Reject a deactivated account with 403 `M_USER_DEACTIVATED`.
+	///
+	/// An account that does not exist is not deactivated, as in Synapse. One
+	/// created without a password, as an appservice's users often are, reads
+	/// as deactivated, since both store an empty password.
+	pub async fn deactivated_check(&self, user_id: &UserId) -> Result {
+		self.db
+			.userid_password
+			.get(user_id)
+			.map_ok(|password| password.is_empty())
 			.await
+			.optional()?
+			.unwrap_or_default()
 			.is_false()
+			.into_option()
 			.ok_or_else(|| err!(Request(UserDeactivated("This user has been deactivated."))))
 	}
 
@@ -396,7 +431,7 @@ impl Service {
 	/// registrations setting a sentinel password will return false here.
 	pub async fn has_password(&self, user_id: &UserId) -> Result<bool> {
 		self.password_hash(user_id)
-			.map_ok(|value| value != PASSWORD_DISABLED && value != PASSWORD_SENTINEL)
+			.map_ok(|value| is_password_hash(&value))
 			.await
 	}
 
@@ -616,4 +651,12 @@ impl Service {
 	#[cfg(not(feature = "ldap"))]
 	#[must_use]
 	pub fn ldap_bind_dn(&self, _localpart: &str) -> Option<String> { None }
+}
+
+/// Whether a stored password value is a real hash rather than a marker.
+///
+/// The disabled marker and the sentinel hold no password to check against.
+#[must_use]
+pub fn is_password_hash(value: &str) -> bool {
+	value != PASSWORD_DISABLED && value != PASSWORD_SENTINEL
 }

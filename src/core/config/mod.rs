@@ -8,6 +8,7 @@ pub mod check;
 mod format;
 mod identity_provider_serde;
 pub mod ip_source;
+mod jwt;
 pub mod manager;
 mod net;
 pub mod proxy;
@@ -99,8 +100,8 @@ pub type ServerUserLocalpart = SmallString<[u8; 32]>;
 ### For more information, see:
 ### https://tuwunel.chat/configuration.html
 "#,
-	ignore = "catchall well_known tls ldap jwt appservice identity_provider storage_provider \
-	          registration_terms smtp",
+	ignore = "catchall well_known tls rate_limiting ldap jwt appservice identity_provider \
+	          storage_provider registration_terms smtp",
 	hidden = "allow_invalid_tls_certificates resolve_state_locally_shadow",
 	forbidden = "database_restore_backup force_migration"
 )]
@@ -344,9 +345,9 @@ pub struct Config {
 	pub eventid_pdu_cache_capacity: u32,
 
 	/// Maximum number of entries in the RocksDB block cache for the
-	/// `eventid_backoff` column family: the recent fetch, auth, and upgrade
-	/// outcomes an event is rate-gated against, keyed by federation step,
-	/// event ID, and time bucket.
+	/// `eventid_backoff` column family: the recent fetch, auth, upgrade, and
+	/// delivery outcomes an event is rate-gated against, keyed by federation
+	/// step, event ID, and time bucket.
 	///
 	/// Same entry-count semantics as `pdu_cache_capacity`. A server working
 	/// through a large missing-ancestry gap reads this column heavily.
@@ -1292,6 +1293,32 @@ pub struct Config {
 	#[serde(default)]
 	pub require_auth_for_profile_requests: bool,
 
+	/// Allow standard users to set or clear their display names through the
+	/// client profile API.
+	///
+	/// Server admins and appservices are always allowed to change display
+	/// names.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub enable_set_displayname: bool,
+
+	/// Restrict client profile retrieval to the user themselves or users who
+	/// currently share a joined room.
+	///
+	/// Appservices are exempt, and other users are refused with 403
+	/// `M_FORBIDDEN`. The server refuses to start, or to reload its
+	/// configuration, with this enabled unless
+	/// `require_auth_for_profile_requests` is enabled too. Federation profile
+	/// lookups are unaffected; `allow_inbound_profile_lookup_federation_requests`
+	/// controls those.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub limit_profile_requests_to_users_who_share_rooms: bool,
+
 	/// Preserve per-room profile overrides during a global profile update.
 	///
 	/// When `true` (default), a profile change (displayname or avatar_url)
@@ -1423,6 +1450,13 @@ pub struct Config {
 	/// reloadable: yes
 	#[serde(default = "true_fn")]
 	pub allow_room_creation: bool,
+
+	/// Allow standard users to create room aliases. Appservices and admins are
+	/// always allowed to create room aliases.
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub allow_room_alias_creation: bool,
 
 	/// Set to false to disable users from joining or creating room versions
 	/// that aren't officially supported by tuwunel. Unstable room versions may
@@ -1787,6 +1821,12 @@ pub struct Config {
 	/// default: true
 	#[serde(default = "true_fn")]
 	pub login_with_password: bool,
+
+	/// Configures request rate limits, one `[global.rate_limiting]` subsection
+	/// per kind of request.
+	// external structure; separate section
+	#[serde(default)]
+	pub rate_limiting: RateLimits,
 
 	/// Login token expiration/TTL in milliseconds.
 	///
@@ -3410,14 +3450,17 @@ pub struct Config {
 	#[serde(default)]
 	pub enforce_stripped_state_pdu_validation: bool,
 
-	/// Allow admins to enter commands in rooms other than "#admins" (admin
-	/// room) by prefixing your message with "\!admin" or "\\!admin" followed up
-	/// a normal tuwunel admin command. The reply will be publicly visible to
-	/// the room, originating from the sender.
+	/// Allow admins to run commands outside the admin room ("#admins") by
+	/// prefixing a message with "\!admin" or "\\!admin" and a normal command.
+	///
+	/// The reply is publicly visible to the room, originating from the sender.
+	/// Disabled by default: the server cannot tell a command an admin typed
+	/// from one in a message the admin forwarded or a bot on their account
+	/// reposted. Message formatting can also hide the command from the admin.
 	///
 	/// reloadable: yes
 	/// example: \\!admin debug ping puppygock.gay
-	#[serde(default = "true_fn")]
+	#[serde(default)]
 	pub admin_escape_commands: bool,
 
 	/// Automatically activate the tuwunel admin room console / CLI on
@@ -4514,13 +4557,13 @@ pub struct JwtConfig {
 	#[serde(default, alias = "secret")]
 	pub key: String,
 
-	/// Format of the 'key'. Only HMAC, ECDSA, and B64HMAC are supported
-	/// Binary keys cannot be pasted into this config, so B64HMAC is an
-	/// alternative to HMAC for properly random secret strings.
-	/// - HMAC is a plaintext shared-secret private-key.
-	/// - B64HMAC is a base64-encoded version of HMAC.
-	/// - ECDSA is a PEM-encoded public-key.
-	/// - EDDSA is a PEM-encoded Ed25519 public-key.
+	/// Format of the 'key': HMAC, B64HMAC, ECDSA, or EDDSA, case-insensitive.
+	///
+	/// HMAC is a plaintext shared secret, and B64HMAC (also spelled HMACB64)
+	/// is the same secret base64-encoded in the standard alphabet with '='
+	/// padding, for random binary secrets that cannot be pasted as text.
+	/// ECDSA and EDDSA are PEM-encoded public keys, EDDSA for Ed25519.
+	/// Startup and reload both refuse an unknown format while JWT is enabled.
 	///
 	/// reloadable: yes
 	/// default: "HMAC"
@@ -4535,7 +4578,10 @@ pub struct JwtConfig {
 	#[serde(default = "true_fn")]
 	pub register_user: bool,
 
-	/// JWT algorithm
+	/// Signature algorithm for validating tokens.
+	///
+	/// The name must suit the key format: HS256, HS384, or HS512 for HMAC
+	/// and B64HMAC, ES256 or ES384 for ECDSA, and EdDSA for EDDSA.
 	///
 	/// reloadable: yes
 	/// default: "HS256"
@@ -4598,6 +4644,127 @@ pub struct JwtConfig {
 	/// default: true
 	#[serde(default = "true_fn")]
 	pub validate_signature: bool,
+}
+
+/// Configures request rate limits.
+///
+/// Each subsection limits one kind of request, such as password sign-in.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting",
+	ignore = "login"
+)]
+pub struct RateLimits {
+	/// Limits password sign-in per account, in the `failed` and `account`
+	/// subsections.
+	// external structure; separate section
+	#[serde(default)]
+	pub login: LoginRateLimits,
+}
+
+/// Limits password sign-in per account on two axes.
+///
+/// Both mirror Synapse's `rc_login` limits of the same purpose and are keyed on
+/// the account rather than the client address.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting.login",
+	ignore = "failed account"
+)]
+pub struct LoginRateLimits {
+	/// Limits wrong passwords against one account.
+	// external structure; separate section
+	#[serde(default)]
+	pub failed: LoginFailedRateLimit,
+
+	/// Limits successful sign-ins to one account.
+	// external structure; separate section
+	#[serde(default)]
+	pub account: LoginAccountRateLimit,
+}
+
+/// Limits wrong passwords against one account.
+///
+/// A name that matches no account counts as a wrong password, so the limit
+/// does not reveal which accounts exist.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting.login.failed"
+)]
+pub struct LoginFailedRateLimit {
+	/// Token-bucket refill rate (failures per second) for wrong passwords
+	/// against one account.
+	///
+	/// Every password attempt takes a token before the password is checked,
+	/// and only a wrong password keeps it; once the bucket is empty, even the
+	/// owner's correct password is refused with `M_LIMIT_EXCEEDED`. Applies to
+	/// `/login` (but not to the LDAP binds it makes), the built-in OIDC login
+	/// page and password re-entry for sensitive actions (UIAA), keyed on the
+	/// account. Mirrors Synapse's `rc_login.failed_attempts` and its default:
+	/// `burst_count` failures, then about one attempt every six seconds, or
+	/// some 14,700 a day.
+	///
+	/// `0` disables this limit rather than making a bucket that never refills.
+	///
+	/// reloadable: yes
+	/// default: 0.17
+	#[serde(default = "default_login_failed_per_second")]
+	pub per_second: f64,
+
+	/// Token-bucket depth (burst size) for wrong passwords against one
+	/// account.
+	///
+	/// The number of failures allowed before `per_second` governs. `0`
+	/// disables this limit, as does a `0` rate. The default is Synapse's
+	/// `rc_login.failed_attempts.burst_count`.
+	///
+	/// reloadable: yes
+	/// default: 3
+	#[serde(default = "default_login_failed_burst_count")]
+	pub burst_count: u32,
+}
+
+/// Limits successful sign-ins to one account.
+///
+/// Only a sign-in by a verified password takes a token, so wrong guesses never
+/// lock the owner out on this axis.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting.login.account"
+)]
+pub struct LoginAccountRateLimit {
+	/// Token-bucket refill rate (sign-ins per second) for successful password
+	/// logins to one account.
+	///
+	/// Applies to `/login` with `m.login.password` (but not to the LDAP binds it
+	/// makes) and to the built-in OIDC login page, keyed on the account rather
+	/// than the client IP. Mirrors Synapse's `rc_login.account` and its default
+	/// of `burst_count` sign-ins, then about one every five and a half minutes;
+	/// once those are used up, a correct password is refused with
+	/// `M_LIMIT_EXCEEDED`.
+	///
+	/// `0` disables this limit rather than making a bucket that never refills.
+	///
+	/// reloadable: yes
+	/// default: 0.003
+	#[serde(default = "default_login_account_per_second")]
+	pub per_second: f64,
+
+	/// Token-bucket depth (burst size) for successful password logins to one
+	/// account.
+	///
+	/// The number of sign-ins allowed before `per_second` governs. `0` disables
+	/// this limit, as does a `0` rate. The default is Synapse's
+	/// `rc_login.account.burst_count`.
+	///
+	/// reloadable: yes
+	/// default: 5
+	#[serde(default = "default_login_account_burst_count")]
+	pub burst_count: u32,
 }
 
 /// Configures outbound email verification through SMTP.
@@ -5468,6 +5635,24 @@ impl TlsConfig {
 	}
 }
 
+impl Default for LoginFailedRateLimit {
+	fn default() -> Self {
+		Self {
+			per_second: default_login_failed_per_second(),
+			burst_count: default_login_failed_burst_count(),
+		}
+	}
+}
+
+impl Default for LoginAccountRateLimit {
+	fn default() -> Self {
+		Self {
+			per_second: default_login_account_per_second(),
+			burst_count: default_login_account_burst_count(),
+		}
+	}
+}
+
 fn true_fn() -> bool { true }
 
 fn default_policy_server_request_timeout() -> u64 { 5 }
@@ -5481,6 +5666,16 @@ fn default_rendezvous_max_sessions() -> usize { 100 }
 fn default_rendezvous_rc_per_second() -> u32 { 10 }
 
 fn default_rendezvous_rc_burst_count() -> u32 { 20 }
+
+// Synapse's `rc_login` defaults, taken unchanged:
+// https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html#rc_login
+fn default_login_failed_per_second() -> f64 { 0.17 }
+
+fn default_login_failed_burst_count() -> u32 { 3 }
+
+fn default_login_account_per_second() -> f64 { 0.003 }
+
+fn default_login_account_burst_count() -> u32 { 5 }
 
 fn some_true_fn() -> Option<bool> { Some(true) }
 

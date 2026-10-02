@@ -78,7 +78,9 @@ pub fn check(config: &Config) -> Result {
 	check_storage(config)?;
 	check_registration(config)?;
 	check_registration_terms(config)?;
+	check_profile_requests(config)?;
 	check_password_hashing(config)?;
+	check_jwt(config)?;
 	check_turn_and_media_misc(config)?;
 	check_url_previews(config)?;
 	check_room_version(config)?;
@@ -113,6 +115,20 @@ fn check_observability(config: &Config) -> Result {
 		return Err!(Config(
 			"sentry_traces_sample_rate",
 			"Sentry traces sample rate must be between 0.0 and 1.0 inclusive"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_profile_requests(config: &Config) -> Result {
+	if config.limit_profile_requests_to_users_who_share_rooms
+		&& !config.require_auth_for_profile_requests
+	{
+		return Err!(Config(
+			"limit_profile_requests_to_users_who_share_rooms",
+			"limit_profile_requests_to_users_who_share_rooms requires \
+			 require_auth_for_profile_requests to be enabled"
 		));
 	}
 
@@ -427,6 +443,17 @@ fn check_password_hashing(config: &Config) -> Result {
 			 hashes are cheaper to crack than the default. See argon2_m_cost for the \
 			 recommended pairs."
 		);
+	}
+
+	Ok(())
+}
+
+fn check_jwt(config: &Config) -> Result {
+	let jwt = &config.jwt;
+
+	// Without [global.jwt], the derived Default's empty format would fail this.
+	if jwt.enable {
+		jwt.key_format()?;
 	}
 
 	Ok(())

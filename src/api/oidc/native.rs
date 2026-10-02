@@ -12,7 +12,7 @@ use serde_json::json;
 use tuwunel_core::{
 	Err, Result, err,
 	smallstr::SmallString,
-	utils::{self, hash, html::escape as html_escape},
+	utils::{self, hash::verify_password, html::escape as html_escape},
 };
 use tuwunel_service::{Services, users::Register};
 use url::Url;
@@ -204,8 +204,15 @@ async fn verify_credentials(
 		return Err(invalid());
 	}
 
+	// The same per-account throttle as `/login`, sharing its buckets, so this
+	// page is not a second, unthrottled way to guess the same password.
+	let reservation = services
+		.login_ratelimit
+		.reserve_login_attempt(&user_id)?;
+
 	// Native registration lowercases the localpart, so resolve to whichever case
-	// carries the password, mirroring `/login`.
+	// carries the password, mirroring `/login`. An unknown account keeps the
+	// reservation as a wrong password does.
 	let (user_id, hash) = match services.users.password_hash(&user_id).await {
 		| Ok(hash) => (user_id, hash),
 		| Err(_) => {
@@ -222,21 +229,28 @@ async fn verify_credentials(
 		},
 	};
 
-	// SSO/LDAP-origin accounts must authenticate through their provider.
-	if services
-		.users
-		.origin(&user_id)
-		.await
-		.is_ok_and(|origin| origin != "password")
-	{
+	// Deactivated accounts, and SSO/LDAP-origin ones that must authenticate
+	// through their provider, have no password here to check.
+	let unchecked = hash.is_empty()
+		|| services
+			.users
+			.origin(&user_id)
+			.await
+			.is_ok_and(|origin| origin != "password");
+
+	if unchecked {
+		services
+			.login_ratelimit
+			.refund_login_attempt(reservation)?;
+
 		return Err(invalid());
 	}
 
-	if hash.is_empty() {
-		return Err(invalid());
-	}
+	verify_password(password, &hash).map_err(|_| invalid())?;
 
-	hash::verify_password(password, &hash).map_err(|_| invalid())?;
+	services
+		.login_ratelimit
+		.record_login(reservation)?;
 
 	Ok(user_id)
 }

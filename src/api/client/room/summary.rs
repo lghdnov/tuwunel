@@ -218,7 +218,7 @@ async fn remote_room_summary_hierarchy_response(
 
 	if services.metadata.is_disabled(room_id).await {
 		return Err!(Request(Forbidden(
-			"Federaton of room {room_id} is currently disabled on this server."
+			"Federation of room {room_id} is currently disabled on this server."
 		)));
 	}
 
@@ -331,9 +331,9 @@ where
 		})
 		.unwrap_or_default();
 
-	let user_in_allowed_restricted_room = allowed_room_ids
-		.stream()
-		.any(|room| services.state_cache.is_joined(sender_user, room));
+	let user_in_allowed_restricted_room = services
+		.state_cache
+		.is_joined_any(sender_user, allowed_room_ids);
 
 	// The allowed-room scan trails; either cheap check can admit first.
 	let can_see = user_can_see_state_events

@@ -88,15 +88,86 @@ fn check_with_captured_logs(config: &Config) -> (Result, String) {
 }
 
 #[test]
+fn admin_escape_commands_default_to_off() {
+	let config = default_config();
+
+	assert!(!config.admin_escape_commands);
+}
+
+fn default_config() -> Config {
+	config_from_toml("[global]\n").expect("default config should parse")
+}
+
+#[test]
 fn url_preview_accept_language_defaults_to_none() {
-	let config = config_from_toml("[global]\n").expect("default config should parse");
+	let config = default_config();
 
 	assert!(config.url_preview_accept_language.is_none());
 }
 
 #[test]
+fn shared_room_profile_requests_require_profile_authentication() {
+	let unauthenticated = "[global]
+limit_profile_requests_to_users_who_share_rooms = true
+";
+
+	let authenticated = "[global]
+require_auth_for_profile_requests = true
+limit_profile_requests_to_users_who_share_rooms = true
+";
+
+	for (toml, valid) in [(unauthenticated, false), (authenticated, true)] {
+		let config = config_from_toml(toml).expect("the config should parse");
+		let result = check(&config);
+
+		assert_eq!(result.is_ok(), valid, "{toml}: {result:?}");
+	}
+}
+
+#[test]
+fn login_rate_limits_default_every_option_left_unset() {
+	let rates = "[global.rate_limiting.login.failed]
+per_second = 1.5
+
+[global.rate_limiting.login.account]
+per_second = 2.5
+";
+
+	let bursts = "[global.rate_limiting.login.failed]
+burst_count = 7
+
+[global.rate_limiting.login.account]
+burst_count = 9
+";
+
+	let account = "[global.rate_limiting.login.account]
+burst_count = 9
+";
+
+	for (toml, expected) in [
+		("[global]\n", [(0.17, 3), (0.003, 5)]),
+		(rates, [(1.5, 3), (2.5, 5)]),
+		(bursts, [(0.17, 7), (0.003, 9)]),
+		(account, [(0.17, 3), (0.003, 9)]),
+	] {
+		let config = config_from_toml(toml).expect("the config should parse");
+
+		assert_eq!(login_limits(&config), expected, "{toml}");
+	}
+}
+
+fn login_limits(config: &Config) -> [(f64, u32); 2] {
+	let LoginRateLimits { failed, account } = &config.rate_limiting.login;
+
+	[
+		(failed.per_second, failed.burst_count),
+		(account.per_second, account.burst_count),
+	]
+}
+
+#[test]
 fn url_preview_accept_language_can_be_reloaded_and_removed() {
-	let original = config_from_toml("[global]\n").expect("default config should parse");
+	let original = default_config();
 	let english = config_from_toml(
 		r#"[global]
 url_preview_accept_language = "en-US,en;q=0.9"
@@ -117,7 +188,7 @@ url_preview_accept_language = "en-US,en;q=0.9"
 
 #[test]
 fn url_preview_accept_language_rejects_invalid_headers() {
-	let original = config_from_toml("[global]\n").expect("default config should parse");
+	let original = default_config();
 
 	for value in ["en\r\nX-Injected: true", "en\n", "en\0"] {
 		let config = Config {
@@ -140,14 +211,14 @@ fn url_preview_accept_language_rejects_invalid_headers() {
 
 #[test]
 fn ip_source_absent_parses_as_none() {
-	let config = config_from_toml("[global]\n").unwrap();
+	let config = default_config();
 
 	assert_eq!(config.ip_source, None);
 }
 
 #[test]
 fn legacy_state_local_switch_is_recognized_and_warned() {
-	let default = config_from_toml("[global]\n").unwrap();
+	let default = default_config();
 	let disabled = config_from_toml(
 		"[global]
 resolve_state_locally = true
@@ -274,7 +345,7 @@ fn legacy_state_local_switch_is_reloadable() {
 
 #[test]
 fn prev_events_concurrency_is_nonzero_and_reloadable() {
-	let default = config_from_toml("[global]\n").unwrap();
+	let default = default_config();
 	let zero = config_from_toml("[global]\nprev_events_concurrency = 0\n").unwrap();
 	let one = config_from_toml("[global]\nprev_events_concurrency = 1\n").unwrap();
 
@@ -384,7 +455,7 @@ ip_source = "{value}"
 
 #[test]
 fn check_accepts_absent_connect_info_and_cf_connecting_ip() {
-	let absent = config_from_toml("[global]\n").unwrap();
+	let absent = default_config();
 	let connect_info = config_from_toml(
 		r#"[global]
 ip_source = "connect_info"
@@ -502,7 +573,7 @@ fn check_bounds_the_animated_thumbnail_concurrency() {
 
 #[test]
 fn reload_rejects_none_to_some_and_some_to_none() {
-	let none = config_from_toml("[global]\n").unwrap();
+	let none = default_config();
 	let some = config_from_toml(
 		r#"[global]
 ip_source = "connect_info"
@@ -571,7 +642,7 @@ fn s3_storage_provider_debug_masks_credentials() {
 
 #[test]
 fn reload_accepts_unchanged_none_and_unchanged_some() {
-	let none = config_from_toml("[global]\n").unwrap();
+	let none = default_config();
 	let some = config_from_toml(
 		r#"[global]
 ip_source = "rightmost_x_forwarded_for"
@@ -1121,6 +1192,40 @@ fn an_out_of_range_sentry_sample_rate_fails_the_config_check() {
 					.contains("'sentry_traces_sample_rate' directive"),
 				"{error}"
 			);
+		}
+	}
+}
+
+/// An enabled JWT login fails the check with an unknown key format.
+///
+/// Every documented spelling passes regardless of letter case, the older
+/// HMACB64 included. A disabled or absent JWT table is left alone, since its
+/// format may be empty.
+#[test]
+fn an_unknown_jwt_key_format_fails_the_config_check() {
+	const ENABLED: &str = "[global.jwt]\nenable = true\n";
+
+	for (toml, valid) in [
+		("[global]\n".to_owned(), true),
+		("[global.jwt]\nformat = \"bogus\"\n".to_owned(), true),
+		(ENABLED.to_owned(), true),
+		(format!("{ENABLED}format = \"hmac\"\n"), true),
+		(format!("{ENABLED}format = \"B64HMAC\"\n"), true),
+		(format!("{ENABLED}format = \"HMACB64\"\n"), true),
+		(format!("{ENABLED}format = \"ECDSA\"\n"), true),
+		(format!("{ENABLED}format = \"EdDSA\"\n"), true),
+		(format!("{ENABLED}format = \"bogus\"\n"), false),
+		(format!("{ENABLED}format = \"\"\n"), false),
+	] {
+		let config = config_from_toml(&toml).expect("the config should parse");
+		let result = check(&config);
+
+		assert_eq!(result.is_ok(), valid, "{toml}: {result:?}");
+
+		if let Err(error) = result {
+			let error = error.to_string();
+
+			assert!(error.contains("'jwt.format' directive"), "{toml}: {error}");
 		}
 	}
 }
